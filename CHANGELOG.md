@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.2.0 (2026-06-23)
+
+### Quality Gate
+- TRIVIAL_PASS: empty/comment-only verify files now correctly FAIL instead of silently PASS
+- Standard verify auto-generation (git status, git diff, docs check, compile, build)
+- Fallback verify when user file missing (uses auto-generated baseline)
+- Result summary appended to observer log for capture-pane detection
+- Verify file dedup: auto-generated checks only appended once
+
+### Escalation Fix
+- P9: escalation claude output pipe `| tail -5 || echo` silently swallowed claude failures (tail -5 always exit 0). Replaced with `tee -a "$OBSERVER_LOG"` + `PIPESTATUS[0]` capture
+- Escalated marker written at all 3 exhaustion exit points (retry exhaustion, bad fixed-exec, no fixed-exec)
+
+### Lessons Flywheel
+- Phase 2 instructions now mandate `cat docs/lessons.md` before writing exec prompt
+- Escalation auto-fix includes lessons analysis for continuous improvement loop
+
+### Documentation
+- SKILL.md Phase 4: Python pseudo-code → executable bash commands with result templates
+- SKILL.md Phase 5: Split into PASS/FAIL templates for clear reporting
+
 ## v0.1.0 (2026-06-23)
 
 ### 起源

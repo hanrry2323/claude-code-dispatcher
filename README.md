@@ -94,6 +94,8 @@ bash: cd /project && test -f data/x.db && echo "ok"
 - **worktree 隔离** — 任务从 `worker/{task_id}` 分支拉 worktree,执行完 merge 回主分支,编译失败保留 worktree 供调试
 - **dead-watcher** — 启动时扫描 queue,僵尸任务(>30min executing)自动转 dead
 - **escalate 升舱** — verify 失败时自动调新 claude 分析 + 改 prompt + 重投,最多 2 次
+- **quality gate 门禁** — TRIVIAL_PASS 检测防止空 verify 文件绕过验收;标准门禁基线(git status/diff/docs/compile/build)自动追加到每次验收
+- **lessons flywheel 学习飞轮** — 每次 exec 前注入 lessons.md,屡败履践,经验持续回灌
 - **headless 模式** — web dashboard 投递时跳过 Terminal.app 弹窗,仅建 tmux 会话
 
 ## 文档
