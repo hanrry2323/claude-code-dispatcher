@@ -153,6 +153,8 @@ unfinished = [t for t in state.get("tasks", []) if t["status"] in ("dispatched",
 写指令文件到 `instructions/v020/V0.XX-NAME.md`。
 同时生成两个 prompt 文件（给后台 claude 用），文件路径带上 workspace 前缀。
 
+**飞轮注入（必须）**：写 exec prompt 前先执行 `cat docs/lessons.md 2>/dev/null || echo "无 lessons"`，把相关教训作为 preamble 注入到 exec prompt 的 `## Goal` 之前。每次都 read，保证 lessons 持续回灌。
+
 **单任务模式（快速修复/小改动）：**
 
 ```bash
@@ -299,50 +301,60 @@ tmux send-keys -t qx-{workspace} "cd $(pwd) && \
 
 投完立刻回复用户："已投递 V0.XX，完成后自动验收并汇总。" 不阻塞。
 
-### Phase 4: 检测（每次用户发消息时自动执行）
+### Phase 4: 检测（每次用户发消息时自动执行 — 必须执行以下 bash）
 
-```python
-# 每次回复前的自动检查
-def check_pending_tasks(state, workspace):
-    for task in state["tasks"]:
-        if task["status"] in ("dispatched", "executing", "verifying"):
-            marker = f"/tmp/qx-done-{workspace}-{task['id']}.marker"
-            if os.path.exists(marker):
-                task["status"] = "done"
-                result = open(f"/tmp/qx-result-{workspace}-{task['id']}.txt").read()
-                task["exec_exit"] = extract_exit_code(result)
-                task["verify_exit"] = extract_verify_code(result)
-                task["completed_at"] = now()
-                save_state()
-                return task
-    return None
+用户在下一轮发消息后，**必须先跑以下命令**读结果文件，按实际 verify_exit 汇报。
+
+```bash
+# 1. 检查 done marker（任务完成）
+if [ -f /tmp/qx-done-{workspace}-{task_id}.marker ]; then
+    cat /tmp/qx-result-{workspace}-{task_id}.txt
+fi
+
+# 2. 检查 escalated marker（升舱失败，需人工介入）
+if [ -f /tmp/qx-escalated-{workspace}-{task_id}.marker ]; then
+    echo "=== [ESCALATED] 自动修复已耗尽，需人工介入 ==="
+fi
+
+# 3. 从 observer 日志读最新状态
+tail -5 /tmp/qx-output-{workspace}.log
 ```
 
-如果检测到新完成的任务，在回复末尾追加汇总。
+汇报模板：
+
+| verify_exit | 汇报 |
+|---|---|
+| 0 | **V0.XX 完成** — 执行: OK 验收: PASS |
+| 1 | **V0.XX 失败** — 执行: OK 验收: FAIL（自动修复已尝试 2 次 / 或 trivial PASS） |
+| escalated marker 存在 | **V0.XX 升舱失败** — 自动修复已耗尽，请人工介入检查 |
+
+**禁止**：不检查 result 文件就直接说"完成"或"PASS"。
 
 ### Phase 5: 汇总
 
-**单任务：**
+按 Phase 4 读取的实际 verify_exit 值汇报。
+
+**通过（verify_exit=0）：**
 
 ```markdown
 **V0.XX 完成**
 
 执行: ✅ exit=0
-验收: ✅ 4/4 PASS (或失败详情)
-
-继续下一轮还是修？
+验收: ✅ 全部 PASS
 ```
 
-**批量：**
+**失败（verify_exit≠0）：**
 
 ```markdown
-**V0.XX-V0.YY 批量完成**
+**V0.XX 失败**
 
 执行: ✅ exit=0
-验收: ✅ 全部通过 (或失败详情)
+验收: ❌ verify_exit=N
 
-Claude Code 自规划→开发→验收全流程跑完。
-需要我终审还是继续下个任务？
+失败详情：
+  ...
+
+继续修还是跳过？
 ```
 
 ## 窗口管理 (v6.5: 由 qx-workflow.sh 兜底, 不依赖上层 agent 自觉)

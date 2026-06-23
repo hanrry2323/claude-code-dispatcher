@@ -130,6 +130,7 @@ MAX_RETRIES=2
 if [ "$RETRY_COUNT" -ge "$MAX_RETRIES" ]; then
     echo "=== [FAIL] 已达最大重试次数 (${RETRY_COUNT})，放弃 ===" | tee -a "$OBSERVER_LOG"
     QUEUE_UPDATE "failed" "exec_exit=|,verify_exit=|,retry_exhausted=true"
+    echo "escalated" > "/tmp/qx-escalated-${WORKSPACE}-${TASK_ID}.marker"
     exit 1
 fi
 
@@ -319,6 +320,33 @@ if [ -d "frontend" ] && [ -f "frontend/package.json" ]; then
 fi
 echo "── 编译检查完成 ──"
 
+### Phase 1.8: 自动生成标准 verify（门禁基线） ###
+STD_VERIFY_FILE="/tmp/qx-std-verify-${WORKSPACE}-${TASK_ID}.txt"
+{
+    echo "# ── 自动生成: 门禁基线 (qx-workflow.sh) ──"
+    echo "# git 工作区检查"
+    echo "bash: echo '=== git status ===' && git status --short 2>/dev/null | head -20 || echo '(no git)'"
+    echo "bash: echo '=== 最近改动文件 ===' && git diff --name-only HEAD~1 2>/dev/null | head -20 || echo '(no git)'"
+    echo "# docs 更新检查"
+    echo 'bash: git status --porcelain 2>/dev/null | awk "/^[^?]/{print \\$2}" | grep -c -E "STATUS|MEMORY|CHANGELOG" || echo "WARN: 文档可能未更新"'
+    echo "# 编译检查（二次确认）"
+    if [ -f "pyproject.toml" ]; then
+        src_dir=$(python3 -c "
+import tomllib, os
+try:
+    with open('pyproject.toml','rb') as f: cfg = tomllib.load(f)
+    for p in cfg.get('tool',{}).get('poetry',{}).get('packages',[]):
+        if 'include' in p: print(p['include']); raise SystemExit
+    print('src') if os.path.isdir('src') else print('.')
+except: print('src')" 2>/dev/null)
+        echo "cmd: python3 -m compileall -q ${src_dir} 2>/dev/null || echo 'WARN: compile check'"
+    fi
+    if [ -d "frontend" ] && [ -f "frontend/package.json" ]; then
+        echo "cmd: cd frontend && bun run build 2>&1 | tail -5 || echo 'WARN: frontend build'"
+    fi
+} > "$STD_VERIFY_FILE"
+echo "── 门禁基线已生成 (${STD_VERIFY_FILE}) ──" | tee -a "$OBSERVER_LOG"
+
 ### Phase 2: 脚本验收 ###
 echo ""
 echo "── 脚本验收 ──"
@@ -326,6 +354,38 @@ echo "── 脚本验收 ──"
 QUEUE_UPDATE "verifying" ""
 VERIFY_EXIT=0
 FAIL_LOG=""
+
+# ── 修复: 空 verify 检测（防止 trivial PASS） ──
+TRIVIAL_PASS=true
+if [ -f "$VERIFY_PROMPT_FILE" ]; then
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        if [[ ! "$line" =~ ^[[:space:]]*# ]]; then
+            TRIVIAL_PASS=false
+            break
+        fi
+    done < "$VERIFY_PROMPT_FILE"
+fi
+if $TRIVIAL_PASS && [ -f "$VERIFY_PROMPT_FILE" ]; then
+    echo "  ❌ TRIVIAL_PASS: verify 文件无实际检查项（仅注释/空行）" | tee -a "$OBSERVER_LOG"
+    VERIFY_EXIT=1
+    FAIL_LOG="TRIVIAL_PASS: verify 文件无实际检查项（仅注释/空行）"
+fi
+
+# ── 追加标准门禁基线到 verify 文件 ──
+# 无论用户 verify 文件是否为空,标准 checks 都追加
+# 确保门禁基线不会被绕过
+# 去重：检查 verify 文件末尾是否已有门禁基线标记
+if [ -f "$VERIFY_PROMPT_FILE" ] && [ -f "$STD_VERIFY_FILE" ]; then
+    if ! grep -q "门禁基线 (qx-workflow.sh)" "$VERIFY_PROMPT_FILE" 2>/dev/null; then
+        echo "" >> "$VERIFY_PROMPT_FILE"
+        cat "$STD_VERIFY_FILE" >> "$VERIFY_PROMPT_FILE"
+        echo "  [门禁基线已追加到 verify 文件]" | tee -a "$OBSERVER_LOG"
+    else
+        echo "  [门禁基线已存在，跳过追加]" | tee -a "$OBSERVER_LOG"
+    fi
+fi
+
 if [ -f "$VERIFY_PROMPT_FILE" ]; then
     # ── 修复(P4)：eval 替换为格式严格化解析器 ──
     #   原实现：`eval "$verify_cmd"` → verify 文件混入非 shell 命令必 FAIL
@@ -380,8 +440,41 @@ if [ -f "$VERIFY_PROMPT_FILE" ]; then
             FAIL_LOG="${FAIL_LOG}EXEC_ERROR: $verify_line"$'\n'
         fi
     done < "$VERIFY_PROMPT_FILE"
+elif [ -f "$STD_VERIFY_FILE" ]; then
+    # 用户未提供 verify 文件,用门禁基线作为唯一校验
+    echo "[INFO] 验收文件不存在,使用自动生成的门禁基线" | tee -a "$OBSERVER_LOG"
+    while IFS= read -r verify_line; do
+        [[ -z "$verify_line" ]] && continue
+        if [[ "$verify_line" =~ ^[[:space:]]*# ]]; then
+            echo "  📝 $verify_line"
+            continue
+        fi
+        if ! [[ "$verify_line" =~ ^[[:space:]]*(cmd|test|grep|bash|#):[[:space:]] ]]; then
+            continue
+        fi
+        verify_cmd="${verify_line#*: }"
+        verify_cmd="${verify_cmd#*:}"
+        case "$verify_line" in
+            grep:*) [[ "$verify_cmd" != grep* ]] && verify_cmd="grep $verify_cmd" ;;
+            test:*) [[ "$verify_cmd" != test* && "$verify_cmd" != \[* ]] && verify_cmd="test $verify_cmd" ;;
+        esac
+        echo "  🔍 $verify_line"
+        if [[ "$verify_line" =~ ^[[:space:]]*bash:[[:space:]] ]]; then
+            cmd_runner() { eval "$verify_cmd" >> "/tmp/qx-verify-${WORKSPACE}-${TASK_ID}.log" 2>&1; }
+        else
+            cmd_runner() { timeout 30 bash -c "$verify_cmd" >> "/tmp/qx-verify-${WORKSPACE}-${TASK_ID}.log" 2>&1; }
+        fi
+        if cmd_runner; then
+            echo "    ✅ PASS" | tee -a "$OBSERVER_LOG"
+        else
+            rc=$?
+            echo "    ❌ FAIL (exit=$rc)"
+            VERIFY_EXIT=1
+            FAIL_LOG="${FAIL_LOG}EXEC_ERROR: $verify_line"$'\n'
+        fi
+    done < "$STD_VERIFY_FILE"
 else
-    echo "[WARN] 验收文件不存在，跳过"
+    echo "[WARN] 验收文件和门禁基线均不存在，跳过验证" | tee -a "$OBSERVER_LOG"
 fi
 
 ### 写结果 ###
@@ -395,6 +488,8 @@ fi
         echo "$FAIL_LOG"
     fi
 } > "$RESULT"
+# ── 增强: result 摘要追加到 observer 日志，主对话可 capture-pane 读取 ──
+echo "=== [RESULT] $TASK_ID exec=$EXEC_EXIT verify=$VERIFY_EXIT ===" >> "$OBSERVER_LOG"
 echo "done" > "$MARKER"
 
 # ── QUEUE_UPDATE 已在脚本顶部定义 ──
@@ -492,7 +587,11 @@ $LESSONS_CONTENT
 5. 只写 prompt 到 $FIXED_EXEC，其他输出忽略
 ESCALATE_EOF
 
-    timeout 300 claude -p "$(cat "$ESCALATE_PROMPT")" --dangerously-skip-permissions --model flash --verbose 2>&1 | tail -5 || echo "[ESCALATE] claude 升舱进程超时或失败" | tee -a "$OBSERVER_LOG"
+    timeout 300 claude -p "$(cat "$ESCALATE_PROMPT")" --dangerously-skip-permissions --model flash --verbose 2>&1 | tee -a "$OBSERVER_LOG"
+    CAPTURE_EXIT=${PIPESTATUS[0]}
+    if [ "$CAPTURE_EXIT" != 0 ]; then
+        echo "[ESCALATE] claude 升舱进程异常 (exit=$CAPTURE_EXIT)" | tee -a "$OBSERVER_LOG"
+    fi
     rm -f "$ESCALATE_PROMPT"
 
     if [ -f "$FIXED_EXEC" ] && [ -s "$FIXED_EXEC" ]; then
@@ -502,10 +601,12 @@ ESCALATE_EOF
             exec "$0" "$TASK_ID" "$WORKSPACE" "$FIXED_EXEC" "$VERIFY_PROMPT_FILE"
         else
             echo "=== [FAIL] fixed-exec 内容不像 prompt（缺 Phase/Goal/git add 关键词） ===" | tee -a "$OBSERVER_LOG"
+            echo "escalated" > "/tmp/qx-escalated-${WORKSPACE}-${TASK_ID}.marker"
             exit 1
         fi
     else
         echo "=== [FAIL] 自动修复失败,fixed-exec 未写入 ===" | tee -a "$OBSERVER_LOG"
+        echo "escalated" > "/tmp/qx-escalated-${WORKSPACE}-${TASK_ID}.marker"
         exit 1
     fi
 fi
