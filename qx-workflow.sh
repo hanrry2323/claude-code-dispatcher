@@ -321,6 +321,14 @@ if [ -f "$VERIFY_PROMPT_FILE" ]; then
     #   新实现：每行只能 # / cmd: / test: / grep: / bash: 开头
     #           解析器用 awk/python3,失败分 parse_error vs exec_error 两类
     #           parse_error 降级为 warn（2026-06-22: 以防模板未同步导致死循环）
+    #
+    # ── 修复(P7)：bash: 链式命令被解析器截断问题 ──
+    #   问题：grep -q 后跟 `&& echo "..."` 时,subshell 在 -q 命中时 echo 不执行,
+    #          verify 解析器只看到 grep 的 exit code,无法判断"附加动作是否完成"。
+    #   新增：解析器检测 bash: 行时,强制走 `eval` 而非 `bash -c "$cmd"`,
+    #          让 `&&` / `||` 链式表达按字面意义执行,echo 的退出码也算数。
+    #   (2026-06-23 smoke test: 升舱过程发现此坑,expid 45194 用追加空行 + commit
+    #    绕过,治标不治本 — 模板不应该要求改业务代码绕过 verify 命令本身)
     while IFS= read -r verify_line; do
         # 跳过空行
         [[ -z "$verify_line" ]] && continue
@@ -345,7 +353,13 @@ if [ -f "$VERIFY_PROMPT_FILE" ]; then
         esac
         echo "  🔍 $verify_line"
         # ── 修复(P4)：用 bash -c 子 shell 而非 eval,加 timeout 30s 防止卡死 ──
-        if timeout 30 bash -c "$verify_cmd" >> /tmp/qx-verify-${WORKSPACE}-${TASK_ID}.log 2>&1; then
+        # ── 修复(P7)：bash: 链式命令特殊处理：走 eval 让 && / || 链式生效 ──
+        if [[ "$verify_line" =~ ^[[:space:]]*bash:[[:space:]] ]]; then
+            cmd_runner() { eval "$verify_cmd" >> "/tmp/qx-verify-${WORKSPACE}-${TASK_ID}.log" 2>&1; }
+        else
+            cmd_runner() { timeout 30 bash -c "$verify_cmd" >> "/tmp/qx-verify-${WORKSPACE}-${TASK_ID}.log" 2>&1; }
+        fi
+        if cmd_runner; then
             echo "    ✅ PASS" | tee -a "$OBSERVER_LOG"
         else
             rc=$?
@@ -398,10 +412,15 @@ if [ "$VERIFY_EXIT" != 0 ]; then
     ESCALATE_PROMPT=$(mktemp)
 
     # ── 收集当前仓库状态作为升舱上下文 ──
-    GIT_DIFF=$(git diff HEAD~1 --stat 2>/dev/null || echo "[无上一个 commit]")
-    GIT_STATUS=$(git status --short 2>/dev/null || echo "[无 git 信息]")
+    #   修复(P8)：用 here-doc + 引用块兜底,避免反引号/$() 被 bash 提前求值
+    #   修复(P8)：git log 限最后 5 commit,diff 限 HEAD vs worktree,降 token 成本
+    #   修复(P8)：捕获 obs log 尾 100 行(失败现场),不混历史
+    GIT_DIFF=$(git diff HEAD --stat 2>/dev/null | head -30 || echo "[无 diff]")
+    GIT_STATUS=$(git status --short 2>/dev/null | head -20 || echo "[无 git 信息]")
+    GIT_LOG=$(git log --oneline -5 2>/dev/null || echo "[无 git 历史]")
     FAIL_LOG_CONTENT=$(echo "$FAIL_LOG" | head -20)
-    LESSONS_CONTENT=$(cat "$WORKSPACE_DIR/docs/lessons.md" 2>/dev/null || echo "[无 lessons.md]")
+    OBS_TAIL=$(tail -100 "$OBSERVER_LOG" 2>/dev/null | head -100 || echo "[无 obs 日志]")
+    LESSONS_CONTENT=$(cat "$WORKSPACE_DIR/docs/lessons.md" 2>/dev/null | tail -50 || echo "[无 lessons.md]")
 
     cat > "$ESCALATE_PROMPT" <<ESCALATE_EOF
 ## 升舱修复任务
@@ -419,13 +438,16 @@ $FAIL_LOG_CONTENT
 
 ### 当前仓库状态
 
-```
-# git diff (HEAD~1 以来的变更)
+\`\`\`
+# git diff (HEAD vs worktree)
 $GIT_DIFF
 
 # git status
 $GIT_STATUS
-```
+
+# git log (last 5)
+$GIT_LOG
+\`\`\`
 
 ### 原始 exec prompt（参考）
 
@@ -435,13 +457,13 @@ $(cat "$EXEC_PROMPT_FILE" 2>/dev/null | head -60)
 
 $(cat "$VERIFY_PROMPT_FILE" 2>/dev/null || echo "N/A")
 
-### 执行日志（最后 50 行，了解当前状态）
+### Observer 日志（最近 100 行，了解当前状态）
 
-```
-$(tail -50 "$OBSERVER_LOG" 2>/dev/null || echo "[无日志]")
-```
+\`\`\`
+$OBS_TAIL
+\`\`\`
 
-### 历史教训（请先读，避免重复踩坑）
+### 历史教训（最近 50 行，请先读，避免重复踩坑）
 
 $LESSONS_CONTENT
 
