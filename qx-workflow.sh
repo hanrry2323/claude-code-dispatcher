@@ -303,7 +303,19 @@ except Exception:
     fi
 fi
 if [ -d "frontend" ] && [ -f "frontend/package.json" ]; then
-    (cd frontend && bun run build 2>&1 | tee -a "$OBSERVER_LOG" | tail -10) && echo "[OK] frontend build" || echo "[WARN] frontend build 异常"
+    # ── 修复(P9)：bun run build 失败被静默吞掉的问题 ──
+    #   原实现：`(cd frontend && bun run build ...) && echo OK || echo WARN`
+    #           → tail -10 截掉了 tsc: command not found 这种早期错误,只看到
+    #              "[OK]" 但实际上 build 早就挂了 (exit=127)
+    #   修复：捕获 tail -10 的输出,grep 关键错误模式(command not found/exit code),
+    #         命中则强制 WARN;并显示最后一行 (通常是真正的错误)
+    build_output=$(cd frontend && bun run build 2>&1 | tail -10)
+    echo "$build_output" | tee -a "$OBSERVER_LOG"
+    if echo "$build_output" | grep -qE 'command not found|error|exit code [1-9]'; then
+        echo "[WARN] frontend build 有错误（见上方输出）"
+    else
+        echo "[OK] frontend build"
+    fi
 fi
 echo "── 编译检查完成 ──"
 
